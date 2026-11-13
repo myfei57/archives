@@ -296,7 +296,6 @@ func (z Zip) getLinkTarget(f *zip.File) (string, error) {
 	}
 	defer file.Close()
 
-	const maxLinkTargetSize = 32768
 	linkTargetBytes, err := io.ReadAll(io.LimitReader(file, maxLinkTargetSize))
 	if err != nil {
 		return "", err
