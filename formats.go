@@ -44,7 +44,11 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 
 	filename = path.Base(filepath.ToSlash(filename))
 
-	rewindableStream, err := newRewindReader(stream)
+	// a budget carried in the context meters physical input reads and
+	// repeated probe decompression separately; nil means no budgeting
+	budget := BudgetFromContext(ctx)
+
+	rewindableStream, err := newRewindReader(stream, budget)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -56,9 +60,15 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 			continue
 		}
 
-		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, nil)
+		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, nil, budget)
 		if err != nil {
 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+		}
+		// a Match implementation may probe-and-discard reader errors;
+		// the sticky budget error ensures such a failure still aborts
+		// identification instead of looking like a non-match
+		if budget != nil && budget.Err() != nil {
+			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, budget.Err())
 		}
 
 		// if matched, wrap input stream with decompression
@@ -77,9 +87,12 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 			continue
 		}
 
-		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, compression)
+		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, compression, budget)
 		if err != nil {
 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+		}
+		if budget != nil && budget.Err() != nil {
+			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, budget.Err())
 		}
 
 		if matchResult.Matched() {
@@ -111,7 +124,7 @@ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, i
 	}
 }
 
-func identifyOne(ctx context.Context, format Format, filename string, stream *rewindReader, comp Compression) (mr MatchResult, err error) {
+func identifyOne(ctx context.Context, format Format, filename string, stream *rewindReader, comp Compression, budget *ArchiveBudget) (mr MatchResult, err error) {
 	defer stream.rewind()
 
 	if filename == "." {
@@ -129,7 +142,15 @@ func identifyOne(ctx context.Context, format Format, filename string, stream *re
 			return MatchResult{}, openErr
 		}
 		defer decompressedStream.Close()
-		mr, err = format.Match(ctx, filename, decompressedStream)
+		// Every probe creates a fresh decompressor, so the CPU work is
+		// repeated even when the physical bytes come from the rewind
+		// cache; meter that output on the separate CPU dimension rather
+		// than re-counting physical input bytes.
+		var probeStream io.Reader = decompressedStream
+		if budget != nil {
+			probeStream = &budgetCPUReader{Reader: decompressedStream, b: budget}
+		}
+		mr, err = format.Match(ctx, filename, probeStream)
 	} else {
 		// Make sure we pass a nil io.Reader not a *rewindReader(nil)
 		var r io.Reader
@@ -285,6 +306,13 @@ func (ca CompressedArchive) Extract(ctx context.Context, sourceArchive io.Reader
 		return fmt.Errorf("no extraction format")
 	}
 	if ca.Compression != nil {
+		// a restricted budget refuses codecs whose internal allocations
+		// cannot be proven bounded before any decoder is constructed
+		if budget := BudgetFromContext(ctx); budget != nil {
+			if err := budget.CheckRestricted(ca.Compression.Extension()); err != nil {
+				return err
+			}
+		}
 		rc, err := ca.Compression.OpenReader(sourceArchive)
 		if err != nil {
 			return err
@@ -327,14 +355,16 @@ type rewindReader struct {
 	start     int64
 	buf       *bytes.Buffer
 	bufReader io.Reader
+	budget    *ArchiveBudget // optional; meters physical input reads only
+	budgetErr error          // sticky: once the physical budget is exceeded, every later Read fails
 }
 
-func newRewindReader(r io.Reader) (*rewindReader, error) {
+func newRewindReader(r io.Reader, budget *ArchiveBudget) (*rewindReader, error) {
 	if r == nil {
 		return nil, nil
 	}
 
-	rr := &rewindReader{Reader: r}
+	rr := &rewindReader{Reader: r, budget: budget}
 
 	// avoid buffering if we have a seeker we can use
 	if seeker, ok := r.(io.Seeker); ok {
@@ -353,6 +383,13 @@ func newRewindReader(r io.Reader) (*rewindReader, error) {
 func (rr *rewindReader) Read(p []byte) (n int, err error) {
 	if rr == nil {
 		panic("reading from nil rewindReader")
+	}
+
+	// once the physical budget has been exceeded the stream is poisoned:
+	// even buffered re-reads fail, so a full ReadFull cannot mask the
+	// breach and the next probe reliably surfaces the budget error
+	if rr.budgetErr != nil {
+		return 0, rr.budgetErr
 	}
 
 	// if there is a buffer we should read from, start
@@ -385,6 +422,17 @@ func (rr *rewindReader) Read(p []byte) (n int, err error) {
 	// the buffer, and nr was how many bytes were read
 	// from the stream; add them to return total count
 	n += nr
+
+	// only bytes pulled from the underlying stream count as physical
+	// input; bytes served from the rewind buffer above never reach this
+	// point, so repeated probes cannot double-charge the same physical
+	// byte (seekers re-read physically and are charged again, honestly).
+	if nr > 0 && rr.budget != nil {
+		if berr := rr.budget.chargeIdentifyPhysical(int64(nr)); berr != nil {
+			rr.budgetErr = berr
+			return n, berr
+		}
+	}
 
 	return
 }

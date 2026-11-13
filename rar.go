@@ -83,6 +83,15 @@ func (r Rar) Match(_ context.Context, filename string, stream io.Reader) (MatchR
 // Archive is not implemented for RAR because it is patent-encumbered.
 
 func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile FileHandler) error {
+	// optional shared resource budget; nil preserves the original behavior
+	budget := BudgetFromContext(ctx)
+
+	// the rardecode decoder's internal solid-block/volume allocations
+	// cannot be proven bounded by an outer metered reader
+	if err := budget.CheckRestricted(r.Extension()); err != nil {
+		return err
+	}
+
 	var options []rardecode.Option
 	if r.Password != "" {
 		options = append(options, rardecode.Password(r.Password))
@@ -125,7 +134,7 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			break
 		}
 		if err != nil {
-			if r.ContinueOnError {
+			if r.ContinueOnError && !errors.Is(err, ErrBudgetExceeded) {
 				log.Printf("[ERROR] Advancing to next file in rar archive: %v", err)
 				continue
 			}
@@ -135,13 +144,25 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			continue
 		}
 
+		// every enumerated header draws on the shared entry allowance
+		if err := budget.countEntry(hdr.Name); err != nil {
+			return err
+		}
+
 		info := rarFileInfo{hdr}
 		file := FileInfo{
 			FileInfo:      info,
 			Header:        hdr,
 			NameInArchive: hdr.Name,
 			Open: func() (fs.File, error) {
-				return fileInArchive{io.NopCloser(rr), info}, nil
+				entryReader := io.ReadCloser(io.NopCloser(rr))
+				if budget != nil {
+					if err := budget.beforeEntry(hdr.Name, hdr.UnPackedSize, true); err != nil {
+						return nil, err
+					}
+					entryReader = budget.newEntryReader(entryReader, hdr.Name)
+				}
+				return fileInArchive{entryReader, info}, nil
 			},
 		}
 
@@ -151,6 +172,9 @@ func (r Rar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		} else if errors.Is(err, fs.SkipDir) && file.IsDir() {
 			skipDirs.add(hdr.Name)
 		} else if err != nil {
+			if errors.Is(err, ErrBudgetExceeded) {
+				return fmt.Errorf("handling file: %s: %w", hdr.Name, err)
+			}
 			return fmt.Errorf("handling file: %s: %w", hdr.Name, err)
 		}
 	}

@@ -32,13 +32,23 @@ func (br Brotli) Match(ctx context.Context, filename string, stream io.Reader) (
 	}
 
 	if stream != nil {
-		mr.ByStream = br.isValidBrotliStream(ctx, stream)
+		matched, err := br.isValidBrotliStream(ctx, stream)
+		if err != nil {
+			return mr, err
+		}
+		mr.ByStream = matched
 	}
 
 	return mr, nil
 }
 
-func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool {
+func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) (bool, error) {
+	// brotli has no magic header, so matching actually decompresses a
+	// small sample; account that CPU work on the Identify CPU dimension
+	// (the physical input bytes it consumes are metered separately by
+	// the rewind reader wrapping this stream).
+	budget := BudgetFromContext(ctx)
+
 	// brotli does not have well-defined file headers or a magic number;
 	// the best way to match the stream is to try decoding a small amount
 	// and see if it succeeds without errors
@@ -47,7 +57,7 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 
 	limitedStream, err := readAtMost(stream, readTarget)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	input := &bytes.Buffer{}
 	r := brotli.NewReader(io.TeeReader(bytes.NewReader(limitedStream), input))
@@ -61,7 +71,7 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 	for totalRead < readTarget {
 		n, err := r.Read(buf)
 		if err != nil && err != io.EOF {
-			return false
+			return false, nil
 		}
 		if n == 0 {
 			break
@@ -70,6 +80,15 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 		totalRead += n
 		if err == io.EOF {
 			break
+		}
+	}
+
+	// the decompressed sample is real CPU work repeated on every probe;
+	// a budget failure must propagate as such rather than look like a
+	// non-matching format
+	if budget != nil && totalRead > 0 {
+		if err := budget.chargeIdentifyCPU(int64(totalRead)); err != nil {
+			return false, err
 		}
 	}
 
@@ -86,20 +105,20 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 		// this is not super efficient; we could probably handle this brotli special case a little better
 		result, _ := format.Match(ctx, "", bytes.NewReader(inputBytes))
 		if result.Matched() {
-			return false
+			return false, nil
 		}
 	}
 
 	expansionRatio := float64(totalRead) / float64(len(inputBytes))
 	if expansionRatio > 1.0 {
 		// Looks like actual decompression happened - this is good
-		return true
+		return true, nil
 	}
 
 	// If the decompressed output is ASCII or UTF-8 characters
 	// it's more likely to be real compressed data(?)
 	if isASCII(outputBytes) || utf8.Valid(outputBytes) {
-		return true
+		return true, nil
 	}
 
 	// A final special (terrible) check for valid brotli streams if we have made it this far
@@ -114,7 +133,7 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 		// - 0x0b (11): 3725 occurrences (38.28%)
 		// - 0x8b (139): 77 occurrences (0.79%)
 		if firstByte == 0x1b || firstByte == 0x0b || firstByte == 0x8b {
-			return true
+			return true, nil
 		}
 	}
 
@@ -124,7 +143,7 @@ func (br Brotli) isValidBrotliStream(ctx context.Context, stream io.Reader) bool
 	// - Decompression "worked" but decompressed data is not much larger than the input data (can legitimately happen with brotli quality=0 and small inputs)
 	// This is suggestive that it is not brotli compressed data.
 	// BUT BEWARE: The current test suite does not actually reach this point.
-	return false
+	return false, nil
 }
 
 // isASCII checks if the given byte slice contains only ASCII printable characters and common whitespace.

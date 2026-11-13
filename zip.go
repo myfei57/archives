@@ -211,6 +211,9 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		return err
 	}
 
+	// optional shared resource budget; nil preserves the original behavior
+	budget := BudgetFromContext(ctx)
+
 	// important to initialize to non-nil, empty value due to how fileIsIncluded works
 	skipDirs := skipList{}
 
@@ -224,6 +227,13 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 
 		if fileIsIncluded(skipDirs, f.Name) {
 			continue
+		}
+
+		// every enumerated header (including empty files and directories)
+		// draws on the shared, cross-layer entry allowance; a budget error
+		// is never subject to ContinueOnError
+		if err := budget.countEntry(f.Name); err != nil {
+			return err
 		}
 
 		info := f.FileInfo()
@@ -242,6 +252,19 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 				if err != nil {
 					return nil, err
 				}
+				if budget != nil {
+					// validate the declared uncompressed size before the
+					// reader is lent out, and meter every actual emitted
+					// byte afterward (a lying header is still caught on Read)
+					if err := budget.beforeEntry(f.Name, int64(f.UncompressedSize64), true); err != nil {
+						openedFile.Close()
+						return nil, err
+					}
+					// the metered reader takes ownership of openedFile and
+					// closes it exactly once; the caller's archive stream
+					// is never touched
+					openedFile = budget.newEntryReader(openedFile, f.Name)
+				}
 				return fileInArchive{openedFile, info}, nil
 			},
 		}
@@ -252,6 +275,9 @@ func (z Zip) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 		} else if errors.Is(err, fs.SkipDir) && file.IsDir() {
 			skipDirs.add(f.Name)
 		} else if err != nil {
+			if errors.Is(err, ErrBudgetExceeded) {
+				return fmt.Errorf("handling file %d: %s: %w", i, f.Name, err)
+			}
 			if z.ContinueOnError {
 				log.Printf("[ERROR] %s: %v", f.Name, err)
 				continue

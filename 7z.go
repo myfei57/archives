@@ -71,6 +71,15 @@ func (z SevenZip) Extract(ctx context.Context, sourceArchive io.Reader, handleFi
 		return fmt.Errorf("determining stream size: %w", err)
 	}
 
+	// optional shared resource budget; nil preserves the original behavior
+	budget := BudgetFromContext(ctx)
+
+	// the 7z decoder's internal solid-block/index allocations cannot be
+	// proven bounded by an outer metered reader
+	if err := budget.CheckRestricted(z.Extension()); err != nil {
+		return err
+	}
+
 	zr, err := sevenzip.NewReaderWithPassword(sra, size, z.Password)
 	if err != nil {
 		return err
@@ -88,6 +97,11 @@ func (z SevenZip) Extract(ctx context.Context, sourceArchive io.Reader, handleFi
 			continue
 		}
 
+		// every enumerated header draws on the shared entry allowance
+		if err := budget.countEntry(f.Name); err != nil {
+			return err
+		}
+
 		fi := f.FileInfo()
 		file := FileInfo{
 			FileInfo:      fi,
@@ -97,6 +111,13 @@ func (z SevenZip) Extract(ctx context.Context, sourceArchive io.Reader, handleFi
 				openedFile, err := f.Open()
 				if err != nil {
 					return nil, err
+				}
+				if budget != nil {
+					if err := budget.beforeEntry(f.Name, fi.Size(), true); err != nil {
+						openedFile.Close()
+						return nil, err
+					}
+					openedFile = budget.newEntryReader(openedFile, f.Name)
 				}
 				return fileInArchive{openedFile, fi}, nil
 			},
@@ -108,6 +129,9 @@ func (z SevenZip) Extract(ctx context.Context, sourceArchive io.Reader, handleFi
 		} else if errors.Is(err, fs.SkipDir) && file.IsDir() {
 			skipDirs.add(f.Name)
 		} else if err != nil {
+			if errors.Is(err, ErrBudgetExceeded) {
+				return fmt.Errorf("handling file %d: %s: %w", i, f.Name, err)
+			}
 			if z.ContinueOnError {
 				log.Printf("[ERROR] %s: %v", f.Name, err)
 				continue

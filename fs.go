@@ -91,9 +91,34 @@ func FileSystem(ctx context.Context, filename string, stream ReaderAtSeeker) (fs
 
 	switch fileFormat := format.(type) {
 	case Extractor:
+		// opening an archive view counts as one nesting layer; the level
+		// and chain come from the parent view (if any) and the shared
+		// budget rejects the view before any resources are held when its
+		// MaxDepth is exceeded
+		budget := BudgetFromContext(ctx)
+		parent := budgetLayerFromContext(ctx)
+		level := parent.level + 1
+		layerName := filepath.Base(filename)
+		if layerName == "" || layerName == "." {
+			layerName = "stream"
+		}
+		chain := append(slices.Clone(parent.chain), layerName)
+		if budget != nil {
+			if err := budget.EnterLayer(level, chain); err != nil {
+				return nil, err
+			}
+		}
+
 		// if no stream was input, return an ArchiveFS that relies on the filepath
 		if stream == nil {
-			return &ArchiveFS{Path: filename, Format: fileFormat, Context: ctx}, nil
+			return &ArchiveFS{
+				Path:        filename,
+				Format:      fileFormat,
+				Context:     ctx,
+				Budget:      budget,
+				budgetLevel: level,
+				budgetChain: chain,
+			}, nil
 		}
 
 		// otherwise, if a stream was input, return an ArchiveFS that relies on that
@@ -107,7 +132,14 @@ func FileSystem(ctx context.Context, filename string, stream ReaderAtSeeker) (fs
 
 		sr := io.NewSectionReader(stream, 0, size)
 
-		return &ArchiveFS{Stream: sr, Format: fileFormat, Context: ctx}, nil
+		return &ArchiveFS{
+			Stream:      sr,
+			Format:      fileFormat,
+			Context:     ctx,
+			Budget:      budget,
+			budgetLevel: level,
+			budgetChain: chain,
+		}, nil
 
 	case Compression:
 		return FileFS{Path: filename, Compression: fileFormat}, nil
@@ -320,17 +352,54 @@ type ArchiveFS struct {
 	Prefix  string          // optional subdirectory in which to root the fs
 	Context context.Context // optional; mainly for cancellation
 
+	// Budget, if set, constrains identification, extraction, and nested
+	// view creation for this file system. It is shared (never copied or
+	// reset) by every view derived from the same value, including Sub and
+	// inner archive views, so nested layers cannot grant themselves fresh
+	// allowances. A budget carried by Context is honored equivalently;
+	// when both are set, this field takes precedence.
+	Budget *ArchiveBudget
+
+	// budgetLevel is the archive nesting layer of this view (1 for a root
+	// archive); budgetChain is the outermost-first archive path leading to
+	// it. They are populated by FileSystem and copied unchanged by Sub.
+	budgetLevel int
+	budgetChain []string
+
 	// amortizing cache speeds up walks (esp. ReadDir)
 	contents map[string]fs.FileInfo
 	dirs     map[string][]fs.DirEntry
 }
 
-// context always return a context, preferring f.Context if not nil.
+// BudgetLevel returns the archive nesting layer represented by this view
+// (1 for a root archive). Use it with [ContextWithBudgetLayer] when opening
+// a nested archive view.
+func (f *ArchiveFS) BudgetLevel() int { return f.budgetLevel }
+
+// BudgetChain returns the outermost-first archive chain of this view.
+func (f *ArchiveFS) BudgetChain() []string { return slices.Clone(f.budgetChain) }
+
+// context always return a context, preferring f.Context if not nil. The
+// shared budget is injected so Extract/Identify calls stay metered even
+// when the caller did not thread the budget through the context itself.
 func (f ArchiveFS) context() context.Context {
-	if f.Context != nil {
-		return f.Context
+	ctx := f.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return context.Background()
+	if f.Budget != nil {
+		ctx = ContextWithBudget(ctx, f.Budget)
+	}
+	return ctx
+}
+
+// budget returns the session budget of this view, if any: the explicit
+// Budget field wins, otherwise the one carried by the context.
+func (f ArchiveFS) budget() *ArchiveBudget {
+	if f.Budget != nil {
+		return f.Budget
+	}
+	return BudgetFromContext(f.context())
 }
 
 // Open opens the named file from within the archive. If name is "." then
@@ -420,6 +489,16 @@ func (f ArchiveFS) Open(name string) (fs.File, error) {
 
 	var decompressor io.ReadCloser
 	if decomp, ok := f.Format.(Decompressor); ok && decomp != nil {
+		// refuse unprovable codecs before constructing the decoder when
+		// the shared budget runs in restricted mode
+		if df, isFormat := decomp.(Format); isFormat {
+			if err := f.budget().CheckRestricted(df.Extension()); err != nil {
+				if archiveFile != nil {
+					archiveFile.Close()
+				}
+				return nil, err
+			}
+		}
 		decompressor, err = decomp.OpenReader(inputStream)
 		if err != nil {
 			return nil, err
@@ -738,6 +817,10 @@ func (f *ArchiveFS) Sub(dir string) (fs.FS, error) {
 	// the reason we don't append to the Path field directly
 	// is because the input might be a stream rather than a
 	// path on disk, and the Prefix field is applied on both
+	//
+	// The budget pointer, nesting level, and archive chain are shared,
+	// not reset: a Sub view is the same archive layer, so deriving one
+	// must never replenish or duplicate any allowance.
 	result := *f
 	result.Prefix = path.Join(f.Prefix, dir)
 	return &result, nil
@@ -770,6 +853,12 @@ type DeepFS struct {
 	// An optional context, mainly for cancellation.
 	Context context.Context
 
+	// Budget, if set, is shared by every inner archive file system this
+	// DeepFS opens. It is never reset per layer or per ReadDir call, so
+	// nested archives draw on the same remaining allowances. A budget
+	// carried by Context is honored equivalently.
+	Budget *ArchiveBudget
+
 	// remember archive file systems for efficiency
 	inners map[string]fs.FS
 	mu     sync.Mutex
@@ -782,7 +871,11 @@ func (fsys *DeepFS) Open(name string) (fs.File, error) {
 	name = path.Join(filepath.ToSlash(fsys.Root), name)
 	realPath, innerPath := fsys.SplitPath(name)
 	if innerPath != "" {
-		if innerFsys := fsys.getInnerFsys(realPath); innerFsys != nil {
+		innerFsys, err := fsys.getInnerFsys(realPath)
+		if err != nil {
+			return nil, err
+		}
+		if innerFsys != nil {
 			return innerFsys.Open(innerPath)
 		}
 	}
@@ -796,7 +889,11 @@ func (fsys *DeepFS) Stat(name string) (fs.FileInfo, error) {
 	name = path.Join(filepath.ToSlash(fsys.Root), name)
 	realPath, innerPath := fsys.SplitPath(name)
 	if innerPath != "" {
-		if innerFsys := fsys.getInnerFsys(realPath); innerFsys != nil {
+		innerFsys, err := fsys.getInnerFsys(realPath)
+		if err != nil {
+			return nil, err
+		}
+		if innerFsys != nil {
 			return fs.Stat(innerFsys, innerPath)
 		}
 	}
@@ -815,7 +912,11 @@ func (fsys *DeepFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	name = path.Join(filepath.ToSlash(fsys.Root), name)
 	realPath, innerPath := fsys.SplitPath(name)
 	if innerPath != "" {
-		if innerFsys := fsys.getInnerFsys(realPath); innerFsys != nil {
+		innerFsys, err := fsys.getInnerFsys(realPath)
+		if err != nil {
+			return nil, err
+		}
+		if innerFsys != nil {
 			return fs.ReadDir(innerFsys, innerPath)
 		}
 	}
@@ -836,7 +937,13 @@ func (fsys *DeepFS) ReadDir(name string) ([]fs.DirEntry, error) {
 // getInnerFsys reuses "inner" file systems, because for example, archives.ArchiveFS
 // amortizes directory entries with the first call to ReadDir; if we don't reuse the
 // file systems then they have to rescan the same archive multiple times.
-func (fsys *DeepFS) getInnerFsys(realPath string) fs.FS {
+//
+// A cache hit returns the existing view without opening a new layer or
+// charging the budget again. A cache miss builds the view through
+// FileSystem, which identifies the archive (metered) and accounts the
+// nesting layer against the shared budget; budget failures propagate
+// instead of being silently downgraded to a plain os.Open.
+func (fsys *DeepFS) getInnerFsys(realPath string) (fs.FS, error) {
 	realPath = filepath.Clean(realPath)
 
 	fsys.mu.Lock()
@@ -845,14 +952,14 @@ func (fsys *DeepFS) getInnerFsys(realPath string) fs.FS {
 	if fsys.inners == nil {
 		fsys.inners = make(map[string]fs.FS)
 	} else if innerFsys, ok := fsys.inners[realPath]; ok {
-		return innerFsys
+		return innerFsys, nil
 	}
 	innerFsys, err := FileSystem(fsys.context(), realPath, nil)
-	if err == nil {
-		fsys.inners[realPath] = innerFsys
-		return innerFsys
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	fsys.inners[realPath] = innerFsys
+	return innerFsys, nil
 }
 
 // SplitPath splits a file path into the "real" path and the "inner" path components,
@@ -918,10 +1025,14 @@ func (*DeepFS) SplitPath(path string) (realPath, innerPath string) {
 }
 
 func (fsys *DeepFS) context() context.Context {
-	if fsys.Context != nil {
-		return fsys.Context
+	ctx := fsys.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return context.Background()
+	if fsys.Budget != nil {
+		ctx = ContextWithBudget(ctx, fsys.Budget)
+	}
+	return ctx
 }
 
 // alwaysDirEntry always returns true for IsDir(). Because

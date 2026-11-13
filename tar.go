@@ -244,6 +244,9 @@ func (t Tar) Insert(ctx context.Context, into io.ReadWriteSeeker, files []FileIn
 func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile FileHandler) error {
 	tr := tar.NewReader(sourceArchive)
 
+	// optional shared resource budget; nil preserves the original behavior
+	budget := BudgetFromContext(ctx)
+
 	// important to initialize to non-nil, empty value due to how fileIsIncluded works
 	skipDirs := skipList{}
 
@@ -257,7 +260,7 @@ func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			break
 		}
 		if err != nil {
-			if t.ContinueOnError && ctx.Err() == nil {
+			if t.ContinueOnError && ctx.Err() == nil && !errors.Is(err, ErrBudgetExceeded) {
 				log.Printf("[ERROR] Advancing to next file in tar archive: %v", err)
 				continue
 			}
@@ -271,6 +274,12 @@ func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			continue
 		}
 
+		// every enumerated header (including empty files and directories)
+		// draws on the shared, cross-layer entry allowance
+		if err := budget.countEntry(hdr.Name); err != nil {
+			return err
+		}
+
 		info := hdr.FileInfo()
 		file := FileInfo{
 			FileInfo:      info,
@@ -278,7 +287,17 @@ func (t Tar) Extract(ctx context.Context, sourceArchive io.Reader, handleFile Fi
 			NameInArchive: hdr.Name,
 			LinkTarget:    hdr.Linkname,
 			Open: func() (fs.File, error) {
-				return fileInArchive{io.NopCloser(tr), info}, nil
+				// tar always carries a declared size; reject a fraudulent or
+				// oversized header before the reader reaches the handler, and
+				// meter the actual bytes emitted on every Read as well
+				entryReader := io.NopCloser(tr)
+				if budget != nil {
+					if err := budget.beforeEntry(hdr.Name, hdr.Size, true); err != nil {
+						return nil, err
+					}
+					entryReader = budget.newEntryReader(entryReader, hdr.Name)
+				}
+				return fileInArchive{entryReader, info}, nil
 			},
 		}
 

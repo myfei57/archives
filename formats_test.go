@@ -16,7 +16,7 @@ import (
 func TestRewindReader(t *testing.T) {
 	data := "the header\nthe body\n"
 
-	r, err := newRewindReader(strings.NewReader(data))
+	r, err := newRewindReader(strings.NewReader(data), nil)
 	if err != nil {
 		t.Errorf("creating rewindReader: %v", err)
 	}
