@@ -105,9 +105,14 @@ func (z Zip) Match(_ context.Context, filename string, stream io.Reader) (MatchR
 	return mr, nil
 }
 
-func (z Zip) Archive(ctx context.Context, output io.Writer, files []FileInfo) error {
+func (z Zip) Archive(ctx context.Context, output io.Writer, files []FileInfo) (err error) {
 	zw := zip.NewWriter(output)
-	defer zw.Close()
+	defer func() {
+		// Finalization errors (e.g. a broken output writer) must be returned.
+		if closeErr := zw.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	for i, file := range files {
 		if err := z.archiveOneFile(ctx, zw, i, file); err != nil {
@@ -118,9 +123,14 @@ func (z Zip) Archive(ctx context.Context, output io.Writer, files []FileInfo) er
 	return nil
 }
 
-func (z Zip) ArchiveAsync(ctx context.Context, output io.Writer, jobs <-chan ArchiveAsyncJob) error {
+func (z Zip) ArchiveAsync(ctx context.Context, output io.Writer, jobs <-chan ArchiveAsyncJob) (err error) {
 	zw := zip.NewWriter(output)
-	defer zw.Close()
+	defer func() {
+		// Finalization errors (e.g. a broken output writer) must be returned.
+		if closeErr := zw.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	var i int
 	for job := range jobs {

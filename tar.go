@@ -72,9 +72,14 @@ func (t Tar) Match(_ context.Context, filename string, stream io.Reader) (MatchR
 	return mr, nil
 }
 
-func (t Tar) Archive(ctx context.Context, output io.Writer, files []FileInfo) error {
+func (t Tar) Archive(ctx context.Context, output io.Writer, files []FileInfo) (err error) {
 	tw := tar.NewWriter(output)
-	defer tw.Close()
+	defer func() {
+		// Finalization errors (e.g. a broken output writer) must be returned.
+		if closeErr := tw.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	for _, file := range files {
 		if err := t.writeFileToArchive(ctx, tw, file); err != nil {
@@ -89,9 +94,14 @@ func (t Tar) Archive(ctx context.Context, output io.Writer, files []FileInfo) er
 	return nil
 }
 
-func (t Tar) ArchiveAsync(ctx context.Context, output io.Writer, jobs <-chan ArchiveAsyncJob) error {
+func (t Tar) ArchiveAsync(ctx context.Context, output io.Writer, jobs <-chan ArchiveAsyncJob) (err error) {
 	tw := tar.NewWriter(output)
-	defer tw.Close()
+	defer func() {
+		// Finalization errors (e.g. a broken output writer) must be returned.
+		if closeErr := tw.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	for job := range jobs {
 		job.Result <- t.writeFileToArchive(ctx, tw, job.File)
